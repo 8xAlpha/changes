@@ -1,0 +1,1490 @@
+diff --git a/.env.example b/.env.example
+index 4831edf..3ced319 100644
+--- a/.env.example
++++ b/.env.example
+@@ -11,6 +11,8 @@ NEXT_PUBLIC_NETWORK=
+ 
+ # Required on mainnet. Sepolia falls back to the current test contracts if unset.
+ NEXT_PUBLIC_VAULT_CONTRACT_ADDRESS=
++# Optional. Block the vault was deployed in; bounds the "last changed" event search.
++NEXT_PUBLIC_VAULT_DEPLOY_BLOCK=
+ NEXT_PUBLIC_PRESALE_CONTRACT_ADDRESS=
+ # Optional. Mainnet defaults to official USDT; Sepolia defaults to the test token.
+ NEXT_PUBLIC_USDT_CONTRACT_ADDRESS=
+diff --git a/README.md b/README.md
+index 2afc946..a22724c 100644
+--- a/README.md
++++ b/README.md
+@@ -18,9 +18,11 @@ Production (`main`) talks to **Ethereum mainnet**. Staging, Vercel Preview, and
+ - ROI dashboard with live contract integration:
+   - read current ROI from the active cycle or latest settled history
+   - read ROI history
+-  - approve `mUSDT` / USDT for the vault when needed
+-  - deposit owner funds via on-chain transaction
+-  - withdraw owner funds via on-chain transaction
++  - vault breakdown: pool, principal with the owner, deposits waiting to join, unclaimed user profit
++  - distribute profit (profit only; users claim it right away)
++  - withdraw principal to trade (waiting deposits join the pool first)
++  - return principal (the cycle closes when all of it is back), or close the cycle with a loss
++  - approve `mUSDT` / USDT for the vault when needed, resetting a leftover approval to 0 first (mainnet USDT requires it)
+ - principal withdraw toggle with owner-gated controls
+ - Logout confirmation modal with wallet disconnect
+ 
+@@ -35,8 +37,11 @@ Functions used by ROI page:
+ - `getCurrentCycle()`
+ - `getROIHistory()`
+ - `owner()`
+-- `ownerDeposit(uint256)`
++- `activePrincipal()`, `deployedPrincipal()`, `pendingPrincipal()`, `profitReserve()`, `ownerWithdrawable()`
++- `distributeProfit(uint256)`
+ - `ownerWithdraw(uint256)`
++- `ownerReturnPrincipal(uint256)`
++- `ownerCloseCycleWithLoss(uint256)`
+ - `principalWithdrawEnabled()`
+ - `togglePrincipalWithdraw()`
+ 
+@@ -55,6 +60,7 @@ Chain / contracts:
+ - `NEXT_PUBLIC_VAULT_CONTRACT_ADDRESS` — **required on Ethereum**. Sepolia defaults to the test vault.
+ - `NEXT_PUBLIC_PRESALE_CONTRACT_ADDRESS` — **required on Ethereum** (same contracts as the public app). Sepolia defaults to the test presale.
+ - `NEXT_PUBLIC_USDT_CONTRACT_ADDRESS` — optional. Ethereum defaults to official USDT; Sepolia defaults to the test token.
++- `NEXT_PUBLIC_VAULT_DEPLOY_BLOCK` — optional. Block the vault was deployed in; bounds the principal-withdraw "last changed" search.
+ 
+ If this admin app is a **separate Vercel Production deploy of the `staging` branch**, you **must** set `NEXT_PUBLIC_CHAIN_ID=11155111`. Otherwise `NEXT_PUBLIC_VERCEL_ENV=production` will select Ethereum.
+ 
+diff --git a/guide.md b/guide.md
+index 80a4002..f05ccc2 100644
+--- a/guide.md
++++ b/guide.md
+@@ -23,8 +23,11 @@ Functions used by ROI page:
+ - `getCurrentCycle()`
+ - `getROIHistory()`
+ - `owner()`
+-- `ownerDeposit(uint256)`
++- `activePrincipal()`, `deployedPrincipal()`, `pendingPrincipal()`, `profitReserve()`, `ownerWithdrawable()`
++- `distributeProfit(uint256)`
+ - `ownerWithdraw(uint256)`
++- `ownerReturnPrincipal(uint256)`
++- `ownerCloseCycleWithLoss(uint256)`
+ - `principalWithdrawEnabled()`
+ - `togglePrincipalWithdraw()`
+ 
+@@ -72,19 +75,19 @@ Wait tx receipt
+ Refetch principalWithdrawEnabled() and update UI
+   |
+   v
+-Enter owner amount
++Pick an owner action: Distribute Profit / Withdraw to Trade / Return Principal / Close With Loss
+   |
+   v
+-If allowance is too low, approve mUSDT for vault spending
++Enter amount (Max / Return all fill it in)
+   |
+   v
+-Click owner deposit or owner withdraw
++If sending USDT and allowance is too low: reset a leftover approval to 0, then approve the amount
+   |
+   v
+-Wait tx receipt
++Send the vault call and wait for the receipt
+   |
+   v
+-Refetch balances + ROI + history and update UI
++Refetch vault breakdown + balances + ROI + history and update UI
+ ```
+ 
+ ## Logout Flow
+@@ -102,7 +105,8 @@ Confirmation modal opens
+ ## Quick Verification Checklist
+ - Connect a non-admin wallet -> `/roi` must be blocked.
+ - Connect admin wallet -> `/roi` should open.
+-- Approve mUSDT with owner wallet when prompted.
+-- Deposit owner funds with owner wallet -> transaction should succeed.
+-- Withdraw owner funds with owner wallet -> transaction should succeed.
+-- Check ROI history table updates after confirmation.
++- Withdraw to Trade with the owner wallet -> waiting deposits join, a cycle opens.
++- Distribute Profit -> users can claim it; ROI history gets a new row.
++- Return Principal (Return all) -> the cycle closes.
++- With a leftover USDT approval, an action first resets it to 0, then approves.
++- Check the vault breakdown and ROI history update after each confirmation.
+diff --git a/src/components/features/roi/FundsActionModal.tsx b/src/components/features/roi/FundsActionModal.tsx
+index 22d8cff..9023cd8 100644
+--- a/src/components/features/roi/FundsActionModal.tsx
++++ b/src/components/features/roi/FundsActionModal.tsx
+@@ -1,125 +1,252 @@
+ 'use client';
+ 
+-import { ArrowDownLeft, ArrowUpRight } from 'lucide-react';
++import { useEffect, useState } from 'react';
++import { AlertTriangle, ArrowDownLeft, ArrowUpRight, Coins } from 'lucide-react';
++import { formatUnits } from 'viem';
+ import { Button } from '@/components/common/Button';
+ import { ActionStatus } from '@/components/features/roi/ActionStatus';
+ import { formatTokenAmount } from '@/components/features/roi/utils';
+-import type { ActionState, FundsModalType } from '@/components/features/roi/types';
++import type { ActionState, FundsModalType, VaultBreakdown } from '@/components/features/roi/types';
+ 
+ type FundsActionModalProps = {
+-  fundsModalType: FundsModalType;
+-  modalTitle: string;
+-  modalPrimaryLabel: string;
+-  modalBalanceLabel: string;
+-  modalBalanceValue?: bigint;
+-  currentCycleTvl?: bigint;
+-  modalAccentLabel: string;
+-  allowanceRaw?: bigint;
+-  parsedAmount: bigint | null;
++  action: FundsModalType;
++  breakdown: VaultBreakdown;
++  ownerTokenBalance?: bigint;
+   tokenDecimals: number;
+   displayTokenSymbol: string;
++  principalWithdrawEnabled?: boolean;
+   amountInput: string;
+-  fundsActionState: ActionState | null;
+-  isUpdatingFunds: boolean;
++  parsedAmount: bigint | null;
++  actionState: ActionState | null;
++  isSubmitting: boolean;
+   onAmountChange: (value: string) => void;
+   onClose: () => void;
+-  onPrimaryAction: () => void;
++  onConfirm: () => void;
+ };
+ 
++const ZERO = BigInt(0);
++
++function percentOf(part: bigint, whole?: bigint) {
++  if (!whole || whole === ZERO) return '--';
++  return ((Number(part) * 100) / Number(whole)).toFixed(2);
++}
++
+ export function FundsActionModal({
+-  fundsModalType,
+-  modalTitle,
+-  modalPrimaryLabel,
+-  modalBalanceLabel,
+-  modalBalanceValue,
+-  currentCycleTvl,
+-  modalAccentLabel,
+-  allowanceRaw,
+-  parsedAmount,
++  action,
++  breakdown,
++  ownerTokenBalance,
+   tokenDecimals,
+   displayTokenSymbol,
++  principalWithdrawEnabled,
+   amountInput,
+-  fundsActionState,
+-  isUpdatingFunds,
++  parsedAmount,
++  actionState,
++  isSubmitting,
+   onAmountChange,
+   onClose,
+-  onPrimaryAction,
++  onConfirm,
+ }: FundsActionModalProps) {
+-  if (!fundsModalType) {
++  const [acknowledged, setAcknowledged] = useState(false);
++
++  useEffect(() => {
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the confirmation each time the modal opens
++    setAcknowledged(false);
++  }, [action]);
++
++  if (!action) {
+     return null;
+   }
+ 
++  const fmt = (value?: bigint) => (value !== undefined ? formatTokenAmount(value, tokenDecimals) : '--');
++  const amount = parsedAmount ?? ZERO;
++  const active = breakdown.activePrincipal;
++  const deployed = breakdown.deployedPrincipal ?? ZERO;
++  const pending = breakdown.pendingPrincipal ?? ZERO;
++  const withdrawable = breakdown.ownerWithdrawable ?? ZERO;
++  const cycleOpen = deployed > ZERO;
++  const setMax = (value: bigint) => onAmountChange(formatUnits(value, tokenDecimals));
++
++  // Returning 0 is allowed only when closing with a loss (nothing could be recovered).
++  const needsAmount = action !== 'loss';
++
++  let title = '';
++  let subtitle = '';
++  let icon = <Coins size={18} />;
++  let rows: { label: string; value: string }[] = [];
++  let maxLabel: string | null = null;
++  let maxValue = ZERO;
++  const notes: string[] = [];
++  let warning: string | null = null;
++  let acknowledgement: string | null = null;
++  let error: string | null = null;
++  let confirmLabel = '';
++
++  if (action === 'profit') {
++    title = 'Distribute Profit';
++    subtitle = 'Send only the profit. It is shared by everyone in the pool by the size of their principal, and users can claim it right away.';
++    icon = <Coins size={18} />;
++    rows = [
++      { label: 'Pool (earning)', value: fmt(active) },
++      { label: 'Your wallet', value: fmt(ownerTokenBalance) },
++    ];
++    if (amount > ZERO) {
++      notes.push(`ROI for this distribution: ${percentOf(amount, active)}% of the pool.`);
++    }
++    if (pending > ZERO) {
++      notes.push(`${fmt(pending)} ${displayTokenSymbol} of waiting deposits won't share this profit; they haven't joined the pool yet.`);
++    }
++    if (!cycleOpen) {
++      warning = 'No cycle is open. Distribute a cycle\'s profit before returning its principal, so it goes to the people whose money earned it.';
++    }
++    if (!active || active === ZERO) {
++      error = 'Nobody is in the pool, so there is no one to distribute profit to.';
++    }
++    confirmLabel = 'Distribute Profit';
++  } else if (action === 'return') {
++    title = 'Return Principal';
++    subtitle = 'Bring principal back to the vault. When everything you took out is back, the cycle closes.';
++    icon = <ArrowDownLeft size={18} />;
++    rows = [
++      { label: 'With you (deployed)', value: fmt(deployed) },
++      { label: 'Your wallet', value: fmt(ownerTokenBalance) },
++    ];
++    maxLabel = 'Return all';
++    maxValue = deployed;
++    if (amount > deployed) {
++      error = 'That is more than you took out. Send profit with Distribute Profit instead.';
++    }
++    if (amount > ZERO && amount === deployed) {
++      notes.push('This closes the cycle. Users whose deposits have been through a cycle can then withdraw their principal.');
++      if (principalWithdrawEnabled === false) {
++        warning = 'Principal withdrawals are switched OFF, so users won\'t be able to leave in this window. Turn them on if you want to open a withdrawal window.';
++      }
++      acknowledgement = 'I have already distributed this cycle\'s profit.';
++    }
++    confirmLabel = 'Return Principal';
++  } else if (action === 'loss') {
++    title = 'Close Cycle With a Loss';
++    subtitle = 'Use this only when you cannot return everything you took out. Enter what you can return (0 is allowed).';
++    icon = <AlertTriangle size={18} />;
++    const loss = deployed > amount ? deployed - amount : ZERO;
++    rows = [
++      { label: 'With you (deployed)', value: fmt(deployed) },
++      { label: 'Pool (earning)', value: fmt(active) },
++      { label: 'Loss written off', value: fmt(loss) },
++    ];
++    if (amount >= deployed && deployed > ZERO) {
++      error = 'You are returning everything, so there is no loss. Use Return Principal instead.';
++    } else if (active !== undefined && loss >= active) {
++      error = 'The loss would wipe out the whole pool. Return at least a small amount.';
++    } else {
++      warning = `Every deposit in the pool permanently loses ${percentOf(loss, active)}% of its principal. Profit already earned is not affected.`;
++      acknowledgement = 'I understand this loss is permanent and shared by every deposit in the pool.';
++    }
++    confirmLabel = 'Close With Loss';
++  } else {
++    title = 'Withdraw to Trade';
++    subtitle = 'Take principal out of the vault to trade. The funds go to your wallet and principal stays locked until you return it.';
++    icon = <ArrowUpRight size={18} />;
++    rows = [
++      { label: 'Available to withdraw', value: fmt(withdrawable) },
++      { label: 'Waiting to join', value: fmt(pending) },
++    ];
++    maxLabel = 'Max';
++    maxValue = withdrawable;
++    if (withdrawable === ZERO) {
++      error = 'Nothing is available to withdraw right now.';
++    } else if (amount > withdrawable) {
++      error = 'That is more than is available to withdraw.';
++    }
++    if (pending > ZERO) {
++      notes.push(`${fmt(pending)} ${displayTokenSymbol} of waiting deposits join the pool now and share every distribution from here on. If you owe profit for the current period, distribute it first.`);
++    }
++    if (!cycleOpen) {
++      notes.push('This opens a new cycle.');
++      if (principalWithdrawEnabled) {
++        warning = 'Tip: switch principal withdrawals off before opening a cycle, so the available amount can\'t change while you sign.';
++      }
++    }
++    confirmLabel = 'Withdraw';
++  }
++
++  if (!error && needsAmount && amount > ZERO && action !== 'withdraw' && ownerTokenBalance !== undefined && amount > ownerTokenBalance) {
++    error = `Your wallet doesn't hold enough ${displayTokenSymbol}.`;
++  }
++
++  const enteredZero = /^0*\.?0*$/.test(amountInput.trim()) && amountInput.trim() !== '';
++  const hasAmount = needsAmount ? amount > ZERO : amount > ZERO || enteredZero;
++  const canConfirm = hasAmount && !error && (!acknowledgement || acknowledged) && !isSubmitting;
++
+   return (
+     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm">
+       <div className="panel w-full max-w-md rounded-[28px] border border-white/10 p-6 sm:p-7">
+-        <div className="mb-5 flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-primary/20 bg-primary/10 text-primary">
+-          {fundsModalType === 'deposit' ? <ArrowDownLeft size={18} /> : <ArrowUpRight size={18} />}
++        <div className={`mb-5 flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border ${action === 'loss'
++          ? 'border-red-500/30 bg-red-500/10 text-red-300'
++          : 'border-primary/20 bg-primary/10 text-primary'
++          }`}>
++          {icon}
+         </div>
+-        <div className="mb-6 space-y-3">
++        <div className="mb-5 space-y-2">
+           <p className="text-xs font-medium uppercase tracking-[0.22em] text-white/38">Owner Vault Action</p>
+-          <h2 className="text-2xl font-semibold text-white">{modalTitle}</h2>
++          <h2 className="text-2xl font-semibold text-white">{title}</h2>
++          <p className="text-sm leading-6 text-white/56">{subtitle}</p>
+         </div>
+ 
+-        <div className="mb-4 rounded-[24px] border border-white/8 bg-gradient-to-br from-white/[0.05] to-white/[0.02] p-4 shadow-[0_16px_50px_rgba(0,0,0,0.18)]">
+-          <div className="flex items-center justify-between gap-3">
+-            <div>
+-              <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">{modalBalanceLabel}</div>
+-              <div className="mt-2 text-2xl font-semibold text-white">
+-                {modalBalanceValue !== undefined ? formatTokenAmount(modalBalanceValue, tokenDecimals) : '--'}
+-              </div>
+-              <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/38">{displayTokenSymbol}</div>
++        <div className="mb-4 grid gap-2 rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
++          {rows.map((row) => (
++            <div key={row.label} className="flex items-center justify-between gap-3 text-sm">
++              <span className="text-white/45">{row.label}</span>
++              <span className="font-semibold text-white">{row.value} <span className="text-xs text-white/40">{displayTokenSymbol}</span></span>
+             </div>
+-            <span className="rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-[11px] font-medium text-primary">
+-              {modalAccentLabel}
+-            </span>
+-          </div>
++          ))}
+         </div>
+ 
+-        <div className="mb-4 rounded-[24px] border border-white/8 bg-white/[0.03] p-4">
+-          <div className="flex items-center justify-between gap-3">
+-            <div>
+-              <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">Current cycle TVL</div>
+-              <div className="mt-2 text-xl font-semibold text-white">
+-                {currentCycleTvl !== undefined ? formatTokenAmount(currentCycleTvl, tokenDecimals) : '--'}
+-              </div>
+-              <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/38">{displayTokenSymbol}</div>
+-            </div>
+-          </div>
+-        </div>
+-
+-        {fundsModalType === 'deposit' ? (
+-          <div className="mb-4 rounded-[24px] border border-primary/14 bg-primary/[0.06] p-4">
+-            <div className="flex items-center justify-between gap-3">
+-              <div>
+-                <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">Current vault allowance</div>
+-                <div className="mt-2 text-xl font-semibold text-white">
+-                  {allowanceRaw !== undefined ? formatTokenAmount(allowanceRaw, tokenDecimals) : '--'}
+-                </div>
+-                <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/38">{displayTokenSymbol}</div>
+-              </div>
+-              <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium ${allowanceRaw && allowanceRaw >= (parsedAmount ?? BigInt(0)) && parsedAmount
+-                ? 'border-primary/30 bg-primary/12 text-primary'
+-                : 'border-white/10 bg-white/[0.04] text-white/55'
+-                }`}>
+-                {allowanceRaw && allowanceRaw >= (parsedAmount ?? BigInt(0)) && parsedAmount ? 'Allowance ready' : 'Approval may be needed'}
+-              </span>
+-            </div>
+-          </div>
+-        ) : null}
+-
+-        <div className="mb-5 flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.045] px-4 py-4 focus-within:border-primary/40">
++        <div className="mb-3 flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.045] px-4 py-4 focus-within:border-primary/40">
+           <input
+             type="text"
+             inputMode="decimal"
+             value={amountInput}
+             onChange={(event) => onAmountChange(event.target.value)}
+             placeholder="0.00"
+-            className="w-full bg-transparent text-left text-3xl font-semibold text-white outline-none placeholder:text-white/20"
++            disabled={isSubmitting}
++            className="w-full min-w-0 bg-transparent text-left text-3xl font-semibold text-white outline-none placeholder:text-white/20"
+           />
++          {maxLabel && maxValue > ZERO ? (
++            <button
++              type="button"
++              onClick={() => setMax(maxValue)}
++              disabled={isSubmitting}
++              className="shrink-0 rounded-lg border border-primary/30 px-2 py-1 text-[11px] font-medium text-primary hover:bg-primary/10"
++            >
++              {maxLabel}
++            </button>
++          ) : null}
+           <span className="text-sm font-medium uppercase tracking-[0.18em] text-white/45">{displayTokenSymbol}</span>
+         </div>
+ 
+-        <ActionStatus state={fundsActionState} className="mb-5" />
++        {notes.map((note) => (
++          <p key={note} className="mb-2 text-xs leading-5 text-white/55">{note}</p>
++        ))}
++        {warning ? (
++          <p className="mb-3 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs leading-5 text-amber-100/90">{warning}</p>
++        ) : null}
++        {error ? (
++          <p className="mb-3 text-xs leading-5 text-red-300/90">{error}</p>
++        ) : null}
++        {acknowledgement && !error ? (
++          <label className="mb-4 flex cursor-pointer items-start gap-2 text-xs leading-5 text-white/70">
++            <input
++              type="checkbox"
++              checked={acknowledged}
++              onChange={(event) => setAcknowledged(event.target.checked)}
++              disabled={isSubmitting}
++              className="mt-0.5"
++            />
++            <span>{acknowledgement}</span>
++          </label>
++        ) : null}
++
++        <ActionStatus state={actionState} className="mb-5" />
+ 
+         <div className="flex w-full gap-2 sm:gap-3">
+           <Button
+@@ -127,13 +254,13 @@ export function FundsActionModal({
+             variant="ghost"
+             className="h-10 min-w-0 flex-1 px-3 text-xs sm:h-12 sm:min-w-28 sm:flex-none sm:px-5 sm:text-sm"
+             onClick={onClose}
+-            disabled={isUpdatingFunds}
++            disabled={isSubmitting}
+           />
+           <Button
+-            title={modalPrimaryLabel}
+-            className="h-10 min-w-0 flex-1 px-3 text-xs sm:h-12 sm:min-w-36 sm:flex-none sm:px-5 sm:text-sm"
+-            onClick={onPrimaryAction}
+-            disabled={!parsedAmount || isUpdatingFunds}
++            title={isSubmitting ? 'Working...' : confirmLabel}
++            className={`h-10 min-w-0 flex-1 px-3 text-xs sm:h-12 sm:min-w-36 sm:flex-none sm:px-5 sm:text-sm ${action === 'loss' ? 'bg-red-400 hover:bg-red-300' : ''}`}
++            onClick={onConfirm}
++            disabled={!canConfirm}
+           />
+         </div>
+       </div>
+diff --git a/src/components/features/roi/OwnerVaultActionsPanel.tsx b/src/components/features/roi/OwnerVaultActionsPanel.tsx
+index 76dbe6e..c4a62d4 100644
+--- a/src/components/features/roi/OwnerVaultActionsPanel.tsx
++++ b/src/components/features/roi/OwnerVaultActionsPanel.tsx
+@@ -1,38 +1,50 @@
+ 'use client';
+ 
+-import { ArrowDownLeft, ArrowUpRight, Wallet } from 'lucide-react';
++import { Wallet } from 'lucide-react';
+ import { Button } from '@/components/common/Button';
+ import { ActionStatus } from '@/components/features/roi/ActionStatus';
+ import { formatTokenAmount } from '@/components/features/roi/utils';
+-import type { ActionState } from '@/components/features/roi/types';
++import type { ActionState, OwnerAction, VaultBreakdown } from '@/components/features/roi/types';
+ 
+ type OwnerVaultActionsPanelProps = {
++  breakdown: VaultBreakdown;
+   ownerTokenBalance?: bigint;
+-  vaultTokenBalance?: bigint;
+-  allowanceRaw?: bigint;
++  /** When the open cycle started (unix seconds), if one is open. */
++  cycleOpenedAt?: bigint;
+   tokenDecimals: number;
+   displayTokenSymbol: string;
+   isOwnerLoading: boolean;
+   isOwner: boolean;
+-  isUpdatingFunds: boolean;
++  isBusy: boolean;
+   fundsActionState: ActionState | null;
+-  onDeposit: () => void;
+-  onWithdraw: () => void;
++  onOpen: (action: OwnerAction) => void;
+ };
+ 
++const ZERO = BigInt(0);
++
+ export function OwnerVaultActionsPanel({
++  breakdown,
+   ownerTokenBalance,
+-  vaultTokenBalance,
+-  allowanceRaw,
++  cycleOpenedAt,
+   tokenDecimals,
+   displayTokenSymbol,
+   isOwnerLoading,
+   isOwner,
+-  isUpdatingFunds,
++  isBusy,
+   fundsActionState,
+-  onDeposit,
+-  onWithdraw,
++  onOpen,
+ }: OwnerVaultActionsPanelProps) {
++  const fmt = (value?: bigint) => (value !== undefined ? formatTokenAmount(value, tokenDecimals) : '--');
++  const deployed = breakdown.deployedPrincipal ?? ZERO;
++  const cycleOpen = deployed > ZERO;
++  const cards = [
++    { label: 'Pool (earning)', value: breakdown.activePrincipal, hint: 'Principal of everyone in the pool' },
++    { label: 'With you', value: breakdown.deployedPrincipal, hint: 'Must be returned before users can withdraw principal' },
++    { label: 'Waiting to join', value: breakdown.pendingPrincipal, hint: 'Joins the pool at your next withdraw' },
++    { label: 'Unclaimed user profit', value: breakdown.profitReserve, hint: 'Reserved for users; you can\'t withdraw it' },
++  ];
++  const disabled = !isOwner || isBusy;
++
+   return (
+     <section className="panel w-full rounded-[24px] p-6 sm:p-7">
+       <div className="flex h-full flex-col">
+@@ -43,76 +55,65 @@ export function OwnerVaultActionsPanel({
+             </div>
+             <div>
+               <p className="text-xs uppercase tracking-[0.22em] text-white/42">Owner Vault Actions</p>
+-              <p className="mt-1 text-sm text-white/56">Move owner funds in and out of the vault with dedicated on-chain actions.</p>
++              <p className="mt-1 text-sm text-white/56">
++                {cycleOpen
++                  ? `Cycle open since ${cycleOpenedAt ? new Date(Number(cycleOpenedAt) * 1000).toLocaleString() : '--'}. Principal is locked.`
++                  : 'No cycle open. Users whose deposits have been through a cycle can withdraw principal.'}
++              </p>
+             </div>
+           </div>
+         </div>
+ 
+         <div className="pt-5">
+-          <div className="mb-3 grid gap-3 text-sm text-white/72">
+-            <div className="rounded-[22px] border border-white/8 bg-gradient-to-br from-white/[0.045] to-white/[0.02] p-4 shadow-[0_12px_40px_rgba(0,0,0,0.18)]">
+-              <div className="flex items-start justify-between gap-3">
+-                <div>
+-                  <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">Owner balance</div>
+-                  <div className="mt-2 text-2xl font-semibold text-white">
+-                    {ownerTokenBalance !== undefined ? formatTokenAmount(ownerTokenBalance, tokenDecimals) : '--'}
+-                  </div>
+-                  <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/38">{displayTokenSymbol}</div>
+-                </div>
+-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-primary/15 bg-primary/10 text-primary">
+-                  <ArrowDownLeft size={18} />
+-                </div>
+-              </div>
+-            </div>
+-            <div className="rounded-[22px] border border-white/8 bg-gradient-to-br from-white/[0.045] to-white/[0.02] p-4 shadow-[0_12px_40px_rgba(0,0,0,0.18)]">
+-              <div className="flex items-start justify-between gap-3">
+-                <div>
+-                  <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">Vault balance</div>
+-                  <div className="mt-2 text-2xl font-semibold text-white">
+-                    {vaultTokenBalance !== undefined ? formatTokenAmount(vaultTokenBalance, tokenDecimals) : '--'}
+-                  </div>
+-                  <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/38">{displayTokenSymbol}</div>
+-                </div>
+-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-primary/15 bg-primary/10 text-primary">
+-                  <ArrowUpRight size={18} />
+-                </div>
+-              </div>
+-            </div>
+-            <div className="rounded-[22px] border border-primary/14 bg-primary/[0.06] p-4 shadow-[0_12px_40px_rgba(0,0,0,0.18)]">
+-              <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">Deposit readiness</div>
+-              <div className="mt-2 flex items-center justify-between gap-3">
+-                <div>
+-                  <div className="text-xl font-semibold text-white">
+-                    {allowanceRaw !== undefined ? formatTokenAmount(allowanceRaw, tokenDecimals) : '--'}
+-                  </div>
+-                  <div className="mt-1 text-xs uppercase tracking-[0.18em] text-white/38">Approved {displayTokenSymbol}</div>
+-                </div>
+-                <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium ${allowanceRaw && allowanceRaw > BigInt(0)
+-                  ? 'border-primary/30 bg-primary/12 text-primary'
+-                  : 'border-white/10 bg-white/[0.04] text-white/55'
+-                  }`}>
+-                  {allowanceRaw && allowanceRaw > BigInt(0) ? 'Ready to deposit' : 'Approval needed'}
+-                </span>
++          <div className="mb-3 grid grid-cols-2 gap-3 text-sm text-white/72">
++            {cards.map((card) => (
++              <div
++                key={card.label}
++                className="rounded-[22px] border border-white/8 bg-gradient-to-br from-white/[0.045] to-white/[0.02] p-4 shadow-[0_12px_40px_rgba(0,0,0,0.18)]"
++              >
++                <div className="text-[11px] uppercase tracking-[0.18em] text-white/34">{card.label}</div>
++                <div className="mt-2 text-xl font-semibold text-white">{fmt(card.value)}</div>
++                <div className="mt-1 text-[11px] leading-4 text-white/38">{card.hint}</div>
+               </div>
+-            </div>
++            ))}
+           </div>
++          <p className="mb-3 text-xs text-white/45">
++            Your wallet: <span className="text-white/72">{fmt(ownerTokenBalance)} {displayTokenSymbol}</span>
++          </p>
++
+           {!isOwnerLoading && !isOwner ? (
+-            <p className="mb-2 text-xs text-amber-300/90">Only the vault owner can approve, deposit, or withdraw owner funds.</p>
++            <p className="mb-2 text-xs text-amber-300/90">Only the vault owner can move funds.</p>
+           ) : null}
++
+           <div className="grid grid-cols-2 gap-2">
+             <Button
+-              title="Deposit"
++              title="Distribute Profit"
+               className="w-full"
+-              onClick={onDeposit}
+-              disabled={!isOwner || isUpdatingFunds}
++              onClick={() => onOpen('profit')}
++              disabled={disabled || !breakdown.activePrincipal}
+             />
+             <Button
+-              title="Withdraw"
++              title="Withdraw to Trade"
+               className="w-full"
+-              onClick={onWithdraw}
+-              disabled={!isOwner || isUpdatingFunds}
++              onClick={() => onOpen('withdraw')}
++              disabled={disabled || !breakdown.ownerWithdrawable}
++            />
++            <Button
++              title="Return Principal"
++              variant="ghost"
++              className="col-span-2 w-full"
++              onClick={() => onOpen('return')}
++              disabled={disabled || !cycleOpen}
+             />
+           </div>
++          <button
++            type="button"
++            onClick={() => onOpen('loss')}
++            disabled={disabled || !cycleOpen}
++            className="mt-3 text-xs text-red-300/80 underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
++          >
++            Close cycle with a loss...
++          </button>
+           <ActionStatus state={fundsActionState} className="mt-2" />
+         </div>
+       </div>
+diff --git a/src/components/features/roi/PrincipalWithdrawPanel.tsx b/src/components/features/roi/PrincipalWithdrawPanel.tsx
+index 8532ef7..bdb194f 100644
+--- a/src/components/features/roi/PrincipalWithdrawPanel.tsx
++++ b/src/components/features/roi/PrincipalWithdrawPanel.tsx
+@@ -50,6 +50,11 @@ export function PrincipalWithdrawPanel({
+           {!isOwnerLoading && !isOwner ? (
+             <p className="text-xs text-amber-300/90">Only the vault owner can change this setting.</p>
+           ) : null}
++          {!isPrincipalWithdrawLoading && principalWithdrawEnabled === false ? (
++            <p className="text-xs text-amber-300/90">
++              Principal withdrawals are OFF. Turn them on before returning principal if you want to open a withdrawal window.
++            </p>
++          ) : null}
+         </div>
+ 
+         <div className="w-full lg:w-auto lg:min-w-[250px]">
+diff --git a/src/components/features/roi/RoiScreen.tsx b/src/components/features/roi/RoiScreen.tsx
+index f5e8ad3..9c3525e 100644
+--- a/src/components/features/roi/RoiScreen.tsx
++++ b/src/components/features/roi/RoiScreen.tsx
+@@ -12,6 +12,7 @@ import { FundsActionModal } from '@/components/features/roi/FundsActionModal';
+ import { OwnerVaultActionsPanel } from '@/components/features/roi/OwnerVaultActionsPanel';
+ import { PrincipalWithdrawPanel } from '@/components/features/roi/PrincipalWithdrawPanel';
+ import { RoiPerformancePanel } from '@/components/features/roi/RoiPerformancePanel';
++import { useOwnerVaultActions } from '@/components/features/roi/useOwnerVaultActions';
+ import { ensureAppKit } from '@/lib/appkit';
+ import type {
+   ActionState,
+@@ -31,11 +32,14 @@ import {
+   VAULT_CONTRACT_ADDRESS,
+   VAULT_ROI_ABI,
+ } from '@/lib/contracts/vault';
+-import { APP_CHAIN_ID, appChainLabel } from '@/lib/network';
++import { APP_CHAIN_ID, appChainLabel, VAULT_DEPLOY_BLOCK } from '@/lib/network';
+ import { formatTxError } from '@/lib/utils';
+ 
+ ensureAppKit();
+ 
++const LOG_WINDOW = BigInt(10_000);
++const MAX_LOG_WINDOWS = 30;
++
+ function statusToContentMode(status: RoiStatus): ContentMode {
+   return status === 'auto' ? 'live' : 'manual';
+ }
+@@ -46,7 +50,6 @@ export function RoiScreen() {
+   const [hasMounted, setHasMounted] = useState(false);
+   const [amountInput, setAmountInput] = useState('');
+   const [fundsModalType, setFundsModalType] = useState<FundsModalType>(null);
+-  const [fundsActionState, setFundsActionState] = useState<ActionState | null>(null);
+   const [principalActionState, setPrincipalActionState] = useState<ActionState | null>(null);
+   const [lastPrincipalChangeAt, setLastPrincipalChangeAt] = useState<string | null>(null);
+   const [contentMode, setContentMode] = useState<ContentMode>('manual');
+@@ -147,20 +150,6 @@ export function RoiScreen() {
+     },
+   });
+ 
+-  const {
+-    data: allowanceRaw,
+-    refetch: refetchAllowance,
+-  } = useReadContract({
+-    address: tokenReadAddress,
+-    abi: ERC20_ABI,
+-    functionName: 'allowance',
+-    args: address && vaultAddress ? [address as Address, vaultAddress] : undefined,
+-    chainId: APP_CHAIN_ID,
+-    query: {
+-      enabled: Boolean(tokenAddress && address && vaultAddress),
+-    },
+-  });
+-
+   const {
+     data: ownerTokenBalanceRaw,
+     refetch: refetchOwnerTokenBalance,
+@@ -175,41 +164,6 @@ export function RoiScreen() {
+     },
+   });
+ 
+-  const {
+-    data: vaultTokenBalanceRaw,
+-    refetch: refetchVaultTokenBalance,
+-  } = useReadContract({
+-    address: tokenReadAddress,
+-    abi: ERC20_ABI,
+-    functionName: 'balanceOf',
+-    args: vaultAddress ? [vaultAddress] : undefined,
+-    chainId: APP_CHAIN_ID,
+-    query: {
+-      enabled: Boolean(tokenAddress && vaultAddress),
+-    },
+-  });
+-
+-  const {
+-    writeContract: writeApproveContract,
+-    data: approveTxHash,
+-    isPending: isSubmittingApprove,
+-    error: approveWriteError,
+-  } = useWriteContract();
+-
+-  const {
+-    writeContract: writeDepositContract,
+-    data: depositTxHash,
+-    isPending: isSubmittingDeposit,
+-    error: depositWriteError,
+-  } = useWriteContract();
+-
+-  const {
+-    writeContract: writeWithdrawContract,
+-    data: withdrawTxHash,
+-    isPending: isSubmittingWithdraw,
+-    error: withdrawWriteError,
+-  } = useWriteContract();
+-
+   const {
+     writeContract: writePrincipalWithdrawContract,
+     data: principalWithdrawTxHash,
+@@ -217,30 +171,6 @@ export function RoiScreen() {
+     error: principalWithdrawWriteError,
+   } = useWriteContract();
+ 
+-  const {
+-    isLoading: isConfirmingApprove,
+-    isSuccess: isApproveConfirmed,
+-    error: approveReceiptError,
+-  } = useWaitForTransactionReceipt({
+-    hash: approveTxHash,
+-  });
+-
+-  const {
+-    isLoading: isConfirmingDeposit,
+-    isSuccess: isDepositConfirmed,
+-    error: depositReceiptError,
+-  } = useWaitForTransactionReceipt({
+-    hash: depositTxHash,
+-  });
+-
+-  const {
+-    isLoading: isConfirmingWithdraw,
+-    isSuccess: isWithdrawConfirmed,
+-    error: withdrawReceiptError,
+-  } = useWaitForTransactionReceipt({
+-    hash: withdrawTxHash,
+-  });
+-
+   const {
+     isLoading: isConfirmingPrincipalWithdraw,
+     isSuccess: isPrincipalWithdrawConfirmed,
+@@ -255,16 +185,11 @@ export function RoiScreen() {
+   const latestHistoryItem = historyRows.at(-1);
+   const ownerAddress = ownerRaw as Address | undefined;
+   const ownerTokenBalance = ownerTokenBalanceRaw as bigint | undefined;
+-  const vaultTokenBalance = vaultTokenBalanceRaw as bigint | undefined;
+   const principalWithdrawEnabled = principalWithdrawEnabledRaw as boolean | undefined;
+   const tokenDecimals = typeof tokenDecimalsRaw === 'number' ? tokenDecimalsRaw : 6;
+   const tokenSymbol = typeof tokenSymbolRaw === 'string' && tokenSymbolRaw.trim() ? tokenSymbolRaw : undefined;
+   const isOwner = Boolean(address && ownerAddress && address.toLowerCase() === ownerAddress.toLowerCase());
+   const isUpdatingPrincipalWithdraw = isSubmittingPrincipalWithdraw || isConfirmingPrincipalWithdraw;
+-  const isApproving = isSubmittingApprove || isConfirmingApprove;
+-  const isDepositing = isSubmittingDeposit || isConfirmingDeposit;
+-  const isWithdrawing = isSubmittingWithdraw || isConfirmingWithdraw;
+-  const isUpdatingFunds = isApproving || isDepositing || isWithdrawing;
+ 
+   const formatRoiPercent = useCallback(
+     (roiUnits: bigint) => {
+@@ -287,7 +212,6 @@ export function RoiScreen() {
+     }
+   }, [amountInput, tokenDecimals]);
+ 
+-  const allowanceSufficient = Boolean(parsedAmount && allowanceRaw && allowanceRaw >= parsedAmount);
+   const currentRoiUnits = currentCycle && currentCycle.roiBps > BigInt(0)
+     ? currentCycle.roiBps
+     : latestHistoryItem?.roi ?? BigInt(0);
+@@ -389,13 +313,31 @@ export function RoiScreen() {
+       ? 'Enabled'
+       : 'Disabled';
+   const displayTokenSymbol = normalizeTokenSymbol(tokenSymbol);
+-  const primaryFundsButtonTitle = isApproving
+-    ? `Approving ${displayTokenSymbol}...`
+-    : isDepositing
+-      ? 'Depositing...'
+-      : allowanceSufficient
+-        ? 'Confirm Deposit'
+-        : `Approve ${displayTokenSymbol}`;
++
++  const refreshAfterFunds = useCallback(() => {
++    refetchCurrentCycle();
++    refetchHistory();
++    refetchOwnerTokenBalance();
++  }, [refetchCurrentCycle, refetchHistory, refetchOwnerTokenBalance]);
++
++  const {
++    breakdown,
++    refetchBreakdown,
++    runAction,
++    pendingAction,
++    actionState: fundsActionState,
++    setActionState: setFundsActionState,
++  } = useOwnerVaultActions({
++    account: address as Address | undefined,
++    vaultAddress,
++    tokenAddress,
++    tokenSymbol: displayTokenSymbol,
++    onConfirmed: refreshAfterFunds,
++  });
++  const isUpdatingFunds = pendingAction !== null;
++  const cycleOpenedAt = breakdown.deployedPrincipal && currentCycle && !currentCycle.settled
++    ? currentCycle.withdrawTime
++    : undefined;
+ 
+   const loadLastPrincipalChangeAt = useCallback(async () => {
+     if (!publicClient || !vaultAddress) {
+@@ -403,21 +345,32 @@ export function RoiScreen() {
+     }
+ 
+     try {
+-      const logs = await publicClient.getLogs({
+-        address: vaultAddress,
+-        event: PRINCIPAL_WITHDRAW_TOGGLED_EVENT,
+-        fromBlock: BigInt(0),
+-        toBlock: 'latest',
+-      });
+-      const latestLog = logs.at(-1);
++      // RPC providers cap log ranges, so search backwards in windows instead of from block 0.
++      const latest = await publicClient.getBlockNumber();
++      const span = LOG_WINDOW * BigInt(MAX_LOG_WINDOWS);
++      const floor = VAULT_DEPLOY_BLOCK ?? (latest > span ? latest - span : BigInt(0));
++      let toBlock = latest;
++
++      for (let i = 0; i < MAX_LOG_WINDOWS && toBlock >= floor; i++) {
++        const fromBlock = toBlock - floor >= LOG_WINDOW ? toBlock - LOG_WINDOW + BigInt(1) : floor;
++        const logs = await publicClient.getLogs({
++          address: vaultAddress,
++          event: PRINCIPAL_WITHDRAW_TOGGLED_EVENT,
++          fromBlock,
++          toBlock,
++        });
++        const latestLog = logs.at(-1);
+ 
+-      if (!latestLog?.blockNumber) {
+-        setLastPrincipalChangeAt(null);
+-        return;
++        if (latestLog?.blockNumber) {
++          const block = await publicClient.getBlock({ blockNumber: latestLog.blockNumber });
++          setLastPrincipalChangeAt(new Date(Number(block.timestamp) * 1000).toLocaleString());
++          return;
++        }
++        if (fromBlock === floor) break;
++        toBlock = fromBlock - BigInt(1);
+       }
+ 
+-      const block = await publicClient.getBlock({ blockNumber: latestLog.blockNumber });
+-      setLastPrincipalChangeAt(new Date(Number(block.timestamp) * 1000).toLocaleString());
++      setLastPrincipalChangeAt(null);
+     } catch {
+       setLastPrincipalChangeAt(null);
+     }
+@@ -499,93 +452,6 @@ export function RoiScreen() {
+     loadLastPrincipalChangeAt();
+   }, [loadLastPrincipalChangeAt]);
+ 
+-  useEffect(() => {
+-    if (!isApproveConfirmed) {
+-      return;
+-    }
+-
+-    refetchAllowance();
+-    setFundsActionState({ type: 'success', message: `${displayTokenSymbol} approval updated successfully.` });
+-  }, [displayTokenSymbol, isApproveConfirmed, refetchAllowance]);
+-
+-  useEffect(() => {
+-    if (!isDepositConfirmed) {
+-      return;
+-    }
+-
+-    refetchAllowance();
+-    refetchCurrentCycle();
+-    refetchHistory();
+-    refetchOwnerTokenBalance();
+-    refetchVaultTokenBalance();
+-    setFundsModalType(null);
+-    setAmountInput('');
+-    setFundsActionState({ type: 'success', message: 'Owner deposit completed successfully.' });
+-  }, [
+-    isDepositConfirmed,
+-    refetchAllowance,
+-    refetchCurrentCycle,
+-    refetchHistory,
+-    refetchOwnerTokenBalance,
+-    refetchVaultTokenBalance,
+-  ]);
+-
+-  useEffect(() => {
+-    if (!isWithdrawConfirmed) {
+-      return;
+-    }
+-
+-    refetchCurrentCycle();
+-    refetchHistory();
+-    refetchOwnerTokenBalance();
+-    refetchVaultTokenBalance();
+-    setFundsModalType(null);
+-    setAmountInput('');
+-    setFundsActionState({ type: 'success', message: 'Owner withdrawal completed successfully.' });
+-  }, [isWithdrawConfirmed, refetchCurrentCycle, refetchHistory, refetchOwnerTokenBalance, refetchVaultTokenBalance]);
+-
+-  useEffect(() => {
+-    if (approveWriteError) {
+-      setFundsActionState({
+-        type: 'error',
+-        message: formatTxError(approveWriteError, `${displayTokenSymbol} approval failed. Please try again.`),
+-      });
+-    } else if (approveReceiptError) {
+-      setFundsActionState({
+-        type: 'error',
+-        message: formatTxError(approveReceiptError, `${displayTokenSymbol} approval failed. Please try again.`),
+-      });
+-    }
+-  }, [approveReceiptError, approveWriteError, displayTokenSymbol]);
+-
+-  useEffect(() => {
+-    if (depositWriteError) {
+-      setFundsActionState({
+-        type: 'error',
+-        message: formatTxError(depositWriteError, 'Owner deposit failed. Please try again.'),
+-      });
+-    } else if (depositReceiptError) {
+-      setFundsActionState({
+-        type: 'error',
+-        message: formatTxError(depositReceiptError, 'Owner deposit failed. Please try again.'),
+-      });
+-    }
+-  }, [depositReceiptError, depositWriteError]);
+-
+-  useEffect(() => {
+-    if (withdrawWriteError) {
+-      setFundsActionState({
+-        type: 'error',
+-        message: formatTxError(withdrawWriteError, 'Owner withdrawal failed. Please try again.'),
+-      });
+-    } else if (withdrawReceiptError) {
+-      setFundsActionState({
+-        type: 'error',
+-        message: formatTxError(withdrawReceiptError, 'Owner withdrawal failed. Please try again.'),
+-      });
+-    }
+-  }, [withdrawReceiptError, withdrawWriteError]);
+-
+   useEffect(() => {
+     if (!isPrincipalWithdrawConfirmed) {
+       return;
+@@ -623,7 +489,7 @@ export function RoiScreen() {
+     }, 3000);
+ 
+     return () => window.clearTimeout(timer);
+-  }, [fundsActionState]);
++  }, [fundsActionState, setFundsActionState]);
+ 
+   useEffect(() => {
+     if (!principalActionState || principalActionState.type === 'info') {
+@@ -661,57 +527,13 @@ export function RoiScreen() {
+     return () => window.clearTimeout(timer);
+   }, [modeActionState]);
+ 
+-  const handlePrimaryFundsAction = () => {
+-    if (!isOwner) {
+-      setFundsActionState({ type: 'error', message: 'Only the vault owner can move owner funds.' });
+-      return;
+-    }
+-
+-    if (!vaultAddress) {
+-      setFundsActionState({ type: 'error', message: `Vault contract address is not configured for ${appChainLabel}.` });
+-      return;
+-    }
+-
+-    if (!tokenAddress) {
+-      setFundsActionState({ type: 'error', message: 'Vault token address is not available yet.' });
+-      return;
+-    }
+-
+-    if (!parsedAmount) {
+-      setFundsActionState({ type: 'error', message: 'Enter a valid amount greater than 0.' });
++  const handleConfirmFunds = async () => {
++    if (!fundsModalType) {
+       return;
+     }
+ 
+-    if (!allowanceSufficient) {
+-      setFundsActionState({ type: 'info', message: `Approving ${displayTokenSymbol} spending for the vault...` });
+-      writeApproveContract({
+-        address: tokenAddress,
+-        abi: ERC20_ABI,
+-        functionName: 'approve',
+-        args: [vaultAddress, parsedAmount],
+-        chainId: APP_CHAIN_ID,
+-      });
+-      return;
+-    }
+-
+-    if (ownerTokenBalance !== undefined && ownerTokenBalance < parsedAmount) {
+-      setFundsActionState({ type: 'error', message: `Owner wallet balance is too low for this ${displayTokenSymbol} deposit.` });
+-      return;
+-    }
+-
+-    setFundsActionState({ type: 'info', message: 'Submitting owner deposit transaction...' });
+-    writeDepositContract({
+-      address: vaultAddress,
+-      abi: VAULT_ROI_ABI,
+-      functionName: 'ownerDeposit',
+-      args: [parsedAmount],
+-      chainId: APP_CHAIN_ID,
+-    });
+-  };
+-
+-  const handleWithdraw = () => {
+     if (!isOwner) {
+-      setFundsActionState({ type: 'error', message: 'Only the vault owner can move owner funds.' });
++      setFundsActionState({ type: 'error', message: 'Only the vault owner can move funds.' });
+       return;
+     }
+ 
+@@ -720,24 +542,13 @@ export function RoiScreen() {
+       return;
+     }
+ 
+-    if (!parsedAmount) {
+-      setFundsActionState({ type: 'error', message: 'Enter a valid amount greater than 0.' });
+-      return;
+-    }
+-
+-    if (vaultTokenBalance !== undefined && vaultTokenBalance < parsedAmount) {
+-      setFundsActionState({ type: 'error', message: `Vault balance is too low for this ${displayTokenSymbol} withdrawal.` });
+-      return;
++    // Closing with a loss may return 0; every other action needs a positive amount.
++    const amount = parsedAmount ?? BigInt(0);
++    const confirmed = await runAction(fundsModalType, amount);
++    if (confirmed) {
++      setFundsModalType(null);
++      setAmountInput('');
+     }
+-
+-    setFundsActionState({ type: 'info', message: 'Submitting owner withdrawal transaction...' });
+-    writeWithdrawContract({
+-      address: vaultAddress,
+-      abi: VAULT_ROI_ABI,
+-      functionName: 'ownerWithdraw',
+-      args: [parsedAmount],
+-      chainId: APP_CHAIN_ID,
+-    });
+   };
+ 
+   const handleTogglePrincipalWithdraw = () => {
+@@ -771,6 +582,9 @@ export function RoiScreen() {
+     setFundsActionState(null);
+     setAmountInput('');
+     setFundsModalType(type);
++    // Maxima (e.g. what can be withdrawn) change as users deposit; read them fresh.
++    void refetchBreakdown();
++    void refetchOwnerTokenBalance();
+   };
+ 
+   const closeFundsModal = () => {
+@@ -782,17 +596,6 @@ export function RoiScreen() {
+     setAmountInput('');
+   };
+ 
+-  const modalTitle = fundsModalType === 'deposit' ? 'Deposit Owner Funds' : 'Withdraw Owner Funds';
+-  const modalPrimaryAction = fundsModalType === 'deposit' ? handlePrimaryFundsAction : handleWithdraw;
+-  const modalPrimaryLabel = fundsModalType === 'deposit'
+-    ? primaryFundsButtonTitle
+-    : isWithdrawing
+-      ? 'Withdrawing...'
+-      : 'Confirm Withdraw';
+-  const modalBalanceLabel = fundsModalType === 'deposit' ? 'Available owner balance' : 'Available vault balance';
+-  const modalBalanceValue = fundsModalType === 'deposit' ? ownerTokenBalance : vaultTokenBalance;
+-  const modalAccentLabel = fundsModalType === 'deposit' ? 'Owner wallet to vault' : 'Vault to owner wallet';
+-
+   if (!hasMounted || status === 'connecting' || status === 'reconnecting') {
+     return (
+       <main className="flex min-h-screen items-center justify-center px-6 text-white/70">
+@@ -842,17 +645,16 @@ export function RoiScreen() {
+             /> */}
+ 
+             <OwnerVaultActionsPanel
++              breakdown={breakdown}
+               ownerTokenBalance={ownerTokenBalance}
+-              vaultTokenBalance={vaultTokenBalance}
+-              allowanceRaw={allowanceRaw}
++              cycleOpenedAt={cycleOpenedAt}
+               tokenDecimals={tokenDecimals}
+               displayTokenSymbol={displayTokenSymbol}
+               isOwnerLoading={isOwnerLoading}
+               isOwner={isOwner}
+-              isUpdatingFunds={isUpdatingFunds}
+-              fundsActionState={fundsActionState}
+-              onDeposit={() => openFundsModal('deposit')}
+-              onWithdraw={() => openFundsModal('withdraw')}
++              isBusy={isUpdatingFunds}
++              fundsActionState={fundsModalType ? null : fundsActionState}
++              onOpen={openFundsModal}
+             />
+           </div>
+ 
+@@ -875,23 +677,19 @@ export function RoiScreen() {
+       </main>
+ 
+       <FundsActionModal
+-        fundsModalType={fundsModalType}
+-        modalTitle={modalTitle}
+-        modalPrimaryLabel={modalPrimaryLabel}
+-        modalBalanceLabel={modalBalanceLabel}
+-        modalBalanceValue={modalBalanceValue}
+-        currentCycleTvl={currentCycle?.tvlAtWithdraw}
+-        modalAccentLabel={modalAccentLabel}
+-        allowanceRaw={allowanceRaw}
+-        parsedAmount={parsedAmount}
++        action={fundsModalType}
++        breakdown={breakdown}
++        ownerTokenBalance={ownerTokenBalance}
+         tokenDecimals={tokenDecimals}
+         displayTokenSymbol={displayTokenSymbol}
++        principalWithdrawEnabled={principalWithdrawEnabled}
+         amountInput={amountInput}
+-        fundsActionState={fundsActionState}
+-        isUpdatingFunds={isUpdatingFunds}
++        parsedAmount={parsedAmount}
++        actionState={fundsActionState}
++        isSubmitting={isUpdatingFunds}
+         onAmountChange={handleAmountChange}
+         onClose={closeFundsModal}
+-        onPrimaryAction={modalPrimaryAction}
++        onConfirm={() => void handleConfirmFunds()}
+       />
+     </div>
+   );
+diff --git a/src/components/features/roi/types.ts b/src/components/features/roi/types.ts
+index c1a6d97..cb75f81 100644
+--- a/src/components/features/roi/types.ts
++++ b/src/components/features/roi/types.ts
+@@ -20,7 +20,24 @@ export type ActionState = {
+   message: string;
+ };
+ 
+-export type FundsModalType = 'deposit' | 'withdraw' | null;
++/** Owner actions on the vault: send profit, bring principal back, close with a loss, take principal to trade. */
++export type OwnerAction = 'profit' | 'return' | 'loss' | 'withdraw';
++
++export type FundsModalType = OwnerAction | null;
++
++/** Where the vault's USDT stands, from the owner's point of view. */
++export type VaultBreakdown = {
++  /** Principal of every deposit in the pool, deployed or not. */
++  activePrincipal?: bigint;
++  /** Principal the owner has taken out and not returned yet (> 0 means a cycle is open). */
++  deployedPrincipal?: bigint;
++  /** Deposits waiting to join the pool at the next withdraw. */
++  pendingPrincipal?: bigint;
++  /** Profit sent to users and not claimed yet. */
++  profitReserve?: bigint;
++  /** The most `ownerWithdraw` accepts right now. */
++  ownerWithdrawable?: bigint;
++};
+ 
+ export type RoiHistoryRow = {
+   id: string;
+diff --git a/src/components/features/roi/useOwnerVaultActions.ts b/src/components/features/roi/useOwnerVaultActions.ts
+new file mode 100644
+index 0000000..79fdb28
+--- /dev/null
++++ b/src/components/features/roi/useOwnerVaultActions.ts
+@@ -0,0 +1,183 @@
++'use client';
++
++import { useCallback, useState } from 'react';
++import type { Address, Hash } from 'viem';
++import { usePublicClient, useReadContracts, useWriteContract } from 'wagmi';
++import type { ActionState, OwnerAction, VaultBreakdown } from '@/components/features/roi/types';
++import { ERC20_ABI, VAULT_ROI_ABI } from '@/lib/contracts/vault';
++import { APP_CHAIN_ID } from '@/lib/network';
++import { formatTxError } from '@/lib/utils';
++
++const ACTION_FUNCTION = {
++  profit: 'distributeProfit',
++  return: 'ownerReturnPrincipal',
++  loss: 'ownerCloseCycleWithLoss',
++  withdraw: 'ownerWithdraw',
++} as const;
++
++const SUCCESS_MESSAGE: Record<OwnerAction, string> = {
++  profit: 'Profit distributed. Users can claim it now.',
++  return: 'Principal returned.',
++  loss: 'Cycle closed and the loss recorded.',
++  withdraw: 'Principal withdrawn to your wallet.',
++};
++
++const FAILURE_MESSAGE: Record<OwnerAction, string> = {
++  profit: 'Profit distribution failed. Please try again.',
++  return: 'Returning principal failed. Please try again.',
++  loss: 'Closing the cycle failed. Please try again.',
++  withdraw: 'Withdrawal failed. Please try again.',
++};
++
++type UseOwnerVaultActionsParams = {
++  account?: Address;
++  vaultAddress?: Address;
++  tokenAddress?: Address;
++  tokenSymbol: string;
++  /** Called after any owner action confirms, so the screen can refresh its other reads. */
++  onConfirmed?: () => void;
++};
++
++/**
++ * Reads the vault breakdown and runs owner actions (distribute profit, return principal,
++ * close with a loss, withdraw to trade) as one sequence: approve USDT if needed, send the
++ * vault call, wait for it to confirm.
++ */
++export function useOwnerVaultActions({
++  account,
++  vaultAddress,
++  tokenAddress,
++  tokenSymbol,
++  onConfirmed,
++}: UseOwnerVaultActionsParams) {
++  const publicClient = usePublicClient({ chainId: APP_CHAIN_ID });
++  const { mutateAsync: writeContractAsync } = useWriteContract();
++  const [pendingAction, setPendingAction] = useState<OwnerAction | null>(null);
++  const [actionState, setActionState] = useState<ActionState | null>(null);
++
++  const vaultRead = { address: vaultAddress as Address, abi: VAULT_ROI_ABI, chainId: APP_CHAIN_ID } as const;
++  const {
++    data: breakdownRaw,
++    isLoading: isBreakdownLoading,
++    refetch: refetchBreakdown,
++  } = useReadContracts({
++    contracts: [
++      { ...vaultRead, functionName: 'activePrincipal' },
++      { ...vaultRead, functionName: 'deployedPrincipal' },
++      { ...vaultRead, functionName: 'pendingPrincipal' },
++      { ...vaultRead, functionName: 'profitReserve' },
++      { ...vaultRead, functionName: 'ownerWithdrawable' },
++    ],
++    query: { enabled: Boolean(vaultAddress) },
++  });
++
++  const valueAt = (index: number) => {
++    const entry = breakdownRaw?.[index];
++    return entry?.status === 'success' ? (entry.result as bigint) : undefined;
++  };
++
++  const breakdown: VaultBreakdown = {
++    activePrincipal: valueAt(0),
++    deployedPrincipal: valueAt(1),
++    pendingPrincipal: valueAt(2),
++    profitReserve: valueAt(3),
++    ownerWithdrawable: valueAt(4),
++  };
++
++  const waitFor = useCallback(
++    async (hash: Hash) => {
++      if (!publicClient) throw new Error('No connection to the network.');
++      const receipt = await publicClient.waitForTransactionReceipt({ hash });
++      if (receipt.status !== 'success') throw new Error('Transaction reverted.');
++    },
++    [publicClient],
++  );
++
++  /** Mainnet USDT rejects changing one non-zero approval to another, so reset to 0 first. */
++  const ensureAllowance = useCallback(
++    async (owner: Address, vault: Address, token: Address, amount: bigint) => {
++      if (!publicClient) throw new Error('No connection to the network.');
++      const allowance = await publicClient.readContract({
++        address: token,
++        abi: ERC20_ABI,
++        functionName: 'allowance',
++        args: [owner, vault],
++      });
++      if (allowance >= amount) return;
++
++      if (allowance > BigInt(0)) {
++        setActionState({ type: 'info', message: `Resetting the ${tokenSymbol} approval to 0 first (USDT requires this)...` });
++        await waitFor(
++          await writeContractAsync({
++            address: token,
++            abi: ERC20_ABI,
++            functionName: 'approve',
++            args: [vault, BigInt(0)],
++            chainId: APP_CHAIN_ID,
++          }),
++        );
++      }
++
++      setActionState({ type: 'info', message: `Approve ${tokenSymbol} for the vault in your wallet...` });
++      await waitFor(
++        await writeContractAsync({
++          address: token,
++          abi: ERC20_ABI,
++          functionName: 'approve',
++          args: [vault, amount],
++          chainId: APP_CHAIN_ID,
++        }),
++      );
++    },
++    [publicClient, tokenSymbol, waitFor, writeContractAsync],
++  );
++
++  const runAction = useCallback(
++    async (action: OwnerAction, amount: bigint) => {
++      if (!account || !vaultAddress || !tokenAddress || !publicClient) {
++        setActionState({ type: 'error', message: 'Wallet or vault is not ready yet.' });
++        return false;
++      }
++
++      setPendingAction(action);
++      try {
++        // Everything except withdraw sends USDT from the owner to the vault.
++        if (action !== 'withdraw' && amount > BigInt(0)) {
++          await ensureAllowance(account, vaultAddress, tokenAddress, amount);
++        }
++
++        setActionState({ type: 'info', message: 'Confirm the transaction in your wallet...' });
++        const hash = await writeContractAsync({
++          address: vaultAddress,
++          abi: VAULT_ROI_ABI,
++          functionName: ACTION_FUNCTION[action],
++          args: [amount],
++          chainId: APP_CHAIN_ID,
++        });
++        setActionState({ type: 'info', message: 'Waiting for confirmation...' });
++        await waitFor(hash);
++
++        setActionState({ type: 'success', message: SUCCESS_MESSAGE[action] });
++        await refetchBreakdown();
++        onConfirmed?.();
++        return true;
++      } catch (error) {
++        setActionState({ type: 'error', message: formatTxError(error, FAILURE_MESSAGE[action]) });
++        return false;
++      } finally {
++        setPendingAction(null);
++      }
++    },
++    [account, ensureAllowance, onConfirmed, publicClient, refetchBreakdown, tokenAddress, vaultAddress, waitFor, writeContractAsync],
++  );
++
++  return {
++    breakdown,
++    isBreakdownLoading,
++    refetchBreakdown,
++    runAction,
++    pendingAction,
++    actionState,
++    setActionState,
++  };
++}
+diff --git a/src/lib/contracts/vault.ts b/src/lib/contracts/vault.ts
+index 4ae2c33..ef08c8e 100644
+--- a/src/lib/contracts/vault.ts
++++ b/src/lib/contracts/vault.ts
+@@ -74,18 +74,67 @@ export const VAULT_ROI_ABI = [
+   },
+   {
+     type: 'function',
+-    name: 'ownerDeposit',
++    name: 'ownerWithdraw',
+     stateMutability: 'nonpayable',
+     inputs: [{ name: 'amount', type: 'uint256' }],
+     outputs: [],
+   },
+   {
+     type: 'function',
+-    name: 'ownerWithdraw',
++    name: 'ownerReturnPrincipal',
++    stateMutability: 'nonpayable',
++    inputs: [{ name: 'amount', type: 'uint256' }],
++    outputs: [],
++  },
++  {
++    type: 'function',
++    name: 'ownerCloseCycleWithLoss',
++    stateMutability: 'nonpayable',
++    inputs: [{ name: 'amountReturned', type: 'uint256' }],
++    outputs: [],
++  },
++  {
++    type: 'function',
++    name: 'distributeProfit',
+     stateMutability: 'nonpayable',
+     inputs: [{ name: 'amount', type: 'uint256' }],
+     outputs: [],
+   },
++  {
++    type: 'function',
++    name: 'activePrincipal',
++    stateMutability: 'view',
++    inputs: [],
++    outputs: [{ name: '', type: 'uint256' }],
++  },
++  {
++    type: 'function',
++    name: 'deployedPrincipal',
++    stateMutability: 'view',
++    inputs: [],
++    outputs: [{ name: '', type: 'uint256' }],
++  },
++  {
++    type: 'function',
++    name: 'pendingPrincipal',
++    stateMutability: 'view',
++    inputs: [],
++    outputs: [{ name: '', type: 'uint256' }],
++  },
++  {
++    type: 'function',
++    name: 'profitReserve',
++    stateMutability: 'view',
++    inputs: [],
++    outputs: [{ name: '', type: 'uint256' }],
++  },
++  {
++    type: 'function',
++    name: 'ownerWithdrawable',
++    stateMutability: 'view',
++    inputs: [],
++    outputs: [{ name: '', type: 'uint256' }],
++  },
+   {
+     type: 'function',
+     name: 'principalWithdrawEnabled',
+diff --git a/src/lib/network.ts b/src/lib/network.ts
+index f5ffe9a..c529126 100644
+--- a/src/lib/network.ts
++++ b/src/lib/network.ts
+@@ -55,6 +55,11 @@ export const USDT_CONTRACT_ADDRESS = (envAddress(process.env.NEXT_PUBLIC_USDT_CO
+ 
+ export const hasAppContracts = Boolean(VAULT_CONTRACT_ADDRESS && PRESALE_CONTRACT_ADDRESS && USDT_CONTRACT_ADDRESS);
+ 
++/** Block the vault was deployed in; bounds event-log searches. Optional. */
++export const VAULT_DEPLOY_BLOCK = /^\d+$/.test(process.env.NEXT_PUBLIC_VAULT_DEPLOY_BLOCK ?? '')
++  ? BigInt(process.env.NEXT_PUBLIC_VAULT_DEPLOY_BLOCK as string)
++  : undefined;
++
+ export function isAppChain(chainId: number | string | undefined | null): boolean {
+   return Number(chainId) === APP_CHAIN_ID;
+ }

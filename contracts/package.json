@@ -1,0 +1,26 @@
+{
+  "name": "singularity-vault-v2-contracts",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compile": "hardhat build",
+    "test": "hardhat test nodejs",
+    "deploy:sepolia": "hardhat run scripts/deploy-vault-v2.ts --network sepolia",
+    "deploy:mainnet": "hardhat run scripts/deploy-vault-v2.ts --network mainnet"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-keystore": "^3.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^3.0.11",
+    "@nomicfoundation/hardhat-node-test-runner": "^3.1.0",
+    "@nomicfoundation/hardhat-verify": "^3.0.0",
+    "@nomicfoundation/hardhat-viem": "^3.0.9",
+    "@types/node": "^22.20.4",
+    "hardhat": "^3.18.0",
+    "typescript": "~5.8.0",
+    "viem": "^2.46.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.6.1"
+  }
+}
